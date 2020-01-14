@@ -302,7 +302,8 @@ static void
 iomap_state(int pos, int expect, int new)
 {
 	if (iomap[pos] != expect)
-		errx(1, "iomap %d: %d != %d", pos, iomap[pos], expect);
+		errx(1, "%d iomap %d: state %d != expected %d",
+		    a.rank, pos, iomap[pos], expect);
 	iomap[pos] = new;
 }
 
@@ -336,11 +337,9 @@ recv_complete(int slot)
 	struct foo *f;
 
 	f = &foo_chunk[slot];
-	iomap_state(slot + f->inplace * a.chunk_count, 1, 1);
+	iomap_state(slot + f->inplace * a.chunk_count, 1, 3);
 
 	mutex_unlock(&f->mutex);
-
-	iomap_state(slot + f->inplace * a.chunk_count, 1, 0);
 }
 
 static int
@@ -348,10 +347,10 @@ start_recv(int pos)
 {
 	struct foo *f;
 
-	iomap_state(tail_foo, 0, 1);
-
 	f = &foo_chunk[tail_foo];
 	mutex_lock(&f->mutex, 0);
+
+	iomap_state(tail_foo, 0, 1);
 	f->inplace = false;
 	
 //	printf("RECV: [%d, %d] pos %d\n", a.rank, a.prev->rank, pos);
@@ -376,8 +375,8 @@ start_inplace_recv(int pos)
 
 	f = &foo_chunk[tail_foo];
 	mutex_lock(&f->mutex, 0);
-	f->inplace = true;
 
+	f->inplace = true;
 	iomap_state(pos + a.chunk_count, 0, 1);
 	
 //	printf("INRECV: [%d, %d] pos %d\n", a.rank, a.prev->rank, pos);
@@ -399,6 +398,8 @@ finish_recv(struct iovec *chunk, struct iovec *iov)
 
 	f = &foo_chunk[head_foo];
 	mutex_lock(&f->mutex, 1);
+
+	iomap_state(head_foo, 3, 0);
 
 	*chunk = f->chunk;
 	*iov = f->iov;
