@@ -37,6 +37,7 @@ enum msg_tag {
 	TAG_QUERY,
 	TAG_ANSWER,
 	TAG_NODE_UP,
+	TAG_UNREGISTER,
 	TAG_ERROR,
 };
 
@@ -56,7 +57,7 @@ mesh_waitrecv(int fd, struct node_msg *msg)
 	if (n == -1)
 		err(1, "read");
 	if (n == 0)
-		errx(1, "waitrecv, EOF");
+		errx(1, "unexpected EOF");
 	if (n != sizeof(*msg))
 		errx(1, "waitrecv, short read");
 }
@@ -83,7 +84,6 @@ mesh_next_rank(void)
 			return i;
 	return -1;
 }
-
 
 static void
 mesh_handle_register(struct node_msg *msg)
@@ -129,8 +129,25 @@ mesh_handle_query(struct node_msg *msg)
 }
 
 static void
+mesh_handle_unregister(struct node_msg *msg)
+{
+	struct node *node;
+	int rank = msg->node.rank;
+
+	if (rank > opt.size) {
+		msg->tag = TAG_ERROR;
+		return;
+	}
+	node = &mesh_node[rank];
+	node->addrlen = 0;		/* XXX hack, add state here */
+
+	msg->tag = TAG_ACK;
+}
+
+static bool
 mesh_internal_message(struct node_msg *msg)
 {
+	bool stop = false;
 
 	switch (msg->tag) {
 	case TAG_QUERY:
@@ -143,20 +160,29 @@ mesh_internal_message(struct node_msg *msg)
 		wait_count++;
 		msg->tag = TAG_ACK;
 		break;
+	case TAG_UNREGISTER:
+		mesh_handle_unregister(msg);
+		stop = true;
+		break;
 	default:
 		msg->tag = TAG_ERROR;
+		stop = true;
 		break;
 	}
+	return stop;
 }
 
-static void
+static bool
 mesh_handle_message(int fd)
 {
 	struct node_msg msg;
+	bool stop;
 
 	mesh_waitrecv(fd, &msg);
-	mesh_internal_message(&msg);
+	stop = mesh_internal_message(&msg);
 	mesh_send(fd, &msg);
+
+	return stop;
 }
 
 static void
@@ -184,6 +210,19 @@ mesh_register(struct node *node)
 
 	mesh_node[msg.node.rank] = msg.node;
 	return msg.node.rank;
+}
+
+static void
+mesh_unregister(int rank)
+{
+	struct node_msg msg = {
+		.tag = TAG_UNREGISTER,
+		.node.rank = rank,
+	};
+
+	mesh_message(&msg);
+	if (msg.tag != TAG_ACK)
+		err(1, "unregister was not ack'd");
 }
 
 static void
@@ -336,6 +375,13 @@ mesh_join(void)
 	return self_rank;
 }
 
+void
+mesh_leave(void)
+{
+	mesh_unregister(self_rank);
+	close(mesh_node[self_rank].fd);
+}
+
 static void
 mesh_ctrl(void)
 {
@@ -356,16 +402,27 @@ mesh_ctrl(void)
 		pfd[i].fd = fd;
 		pfd[i].events = POLLIN;
 	}
-printf("CTRL: All nodes up\n");
+printf("CTRL: All nodes up: %d\n", wait_count);
 
-	for (;;) {
+	while (wait_count) {
 		n = poll(pfd, opt.size, -1);	//opt.timeout);
 		if (n == -1)
 			err(1, "poll");
 		for (i = 0; i < opt.size; i++) {
-			if ((pfd[i].revents & POLLIN) == 0)
+			if (!pfd[i].revents)
 				continue;
-			mesh_handle_message(pfd[i].fd);
+#if 0
+			if ((pfd[i].revents & POLLIN) == 0) {
+				wait_count--;
+				pfd[i].fd = -1;
+				continue;
+			}
+#endif
+			if (mesh_handle_message(pfd[i].fd)) {
+				close(pfd[i].fd);
+				pfd[i].fd = -1;
+				wait_count--;
+			}
 			if (--n == 0)
 				break;
 		}

@@ -81,8 +81,8 @@ drv_push(struct drv_queue *q, struct drv_req *req)
 static void
 drv_queue(struct drv_queue *q, struct drv_req *req)
 {
-	int next;
 	bool empty;
+	int next;
 
 	pthread_mutex_lock(&q->mutex);
 
@@ -104,25 +104,27 @@ drv_queue(struct drv_queue *q, struct drv_req *req)
 	pthread_mutex_unlock(&q->mutex);
 }
 
-static struct drv_req *
+static bool
 drv_dequeue(struct drv_queue *q)
 {
 	struct drv_req *req = NULL;
+	bool empty;
+
+	if (drv_empty(q))
+		errx(1, "dequeue on empty queue");
 
 	pthread_mutex_lock(&q->mutex);
 
-	if (drv_empty(q))
-		goto unlock;
 	req = q->req[q->head++];
 	if (q->head == q->size)
 		q->head = 0;
 
-	if (drv_empty(q))
+	empty = drv_empty(q);
+	if (empty)
 		drv_unregister(req->fd);
 
-unlock:
 	pthread_mutex_unlock(&q->mutex);
-	return req;
+	return empty;
 }
 
 static struct drv_req *
@@ -161,11 +163,16 @@ drv_send_req(struct drv_req *req, int tr)
 static void
 drv_send_cb(struct drv_req *req, int events)
 {
-	while ((req = drv_peek(&send_queue))) {
+	bool empty = false;
+
+printf("SEND CB....\n");
+
+	while (!empty) {
+		req = drv_peek(&send_queue);
 		if (!drv_send_req(req, 1)) {
 			return;
 		}
-		req = drv_dequeue(&send_queue);
+		empty = drv_dequeue(&send_queue);
 		drv_push(&req_stack, req);
 	}
 }
@@ -221,12 +228,14 @@ drv_recv_req(struct drv_req *req, int tr)
 static void
 drv_recv_cb(struct drv_req *req, int events)
 {
+	bool empty = false;
 
-	while ((req = drv_peek(&recv_queue))) {
+	while (!empty) {
+		req = drv_peek(&recv_queue);
 		if (!drv_recv_req(req, 1)) {
 			return;
 		}
-		req = drv_dequeue(&recv_queue);
+		empty = drv_dequeue(&recv_queue);
 		drv_push(&req_stack, req);
 	}
 }

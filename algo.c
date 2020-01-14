@@ -105,6 +105,7 @@ struct foo {
 	struct tmut mutex;
 	struct iovec chunk;
 	struct iovec iov;
+	bool inplace;
 };
 #define FOO_COUNT	256
 struct foo foo_chunk[FOO_COUNT];
@@ -166,6 +167,8 @@ buffer_register(void *buffer, unsigned size)
 #endif
 }
 
+static int *iomap;
+
 static void
 allreduce_alloc(void)
 {
@@ -191,6 +194,8 @@ allreduce_alloc(void)
 		sprintf(label, "recv %d", i);
 		mutex_init(&foo_chunk[i].mutex, label);
 	}
+
+	iomap = calloc(a.tensor_count + a.chunk_count, sizeof(int));
 }
 
 #define assign_if_set(x, y)	if (y) x = y
@@ -293,16 +298,30 @@ debug_iov(const char *label, uint8_t *region, struct iovec *iov, int size)
 }
 #endif
 
+static void
+iomap_state(int pos, int expect, int new)
+{
+	if (iomap[pos] != expect)
+		errx(1, "iomap %d: %d != %d", pos, iomap[pos], expect);
+	iomap[pos] = new;
+}
+
 static int
 send_chunk(int pos)
 {
 	struct iovec iov;
+	int sp = pos + a.chunk_count;
+
+	iomap_state(sp, 0, 2);
 
 //	printf("SEND: [%d, %d] pos %d\n", a.rank, a.next->rank, pos);
 	pos = pos2iov(pos, &iov, a.tensor, a.element_size);
 	debug_iov("SEND", a.tensor, &iov, a.element_size);
 
 	drv_send(a.next->fd, &iov, 0);
+//	drv_recv(a.prev->fd, &f->iov, 1, recv_complete, tail_foo);
+
+	iomap_state(sp, 2, 0);
 
 	return pos;
 }
@@ -317,8 +336,11 @@ recv_complete(int slot)
 	struct foo *f;
 
 	f = &foo_chunk[slot];
+	iomap_state(slot + f->inplace * a.chunk_count, 1, 1);
 
 	mutex_unlock(&f->mutex);
+
+	iomap_state(slot + f->inplace * a.chunk_count, 1, 0);
 }
 
 static int
@@ -326,8 +348,11 @@ start_recv(int pos)
 {
 	struct foo *f;
 
+	iomap_state(tail_foo, 0, 1);
+
 	f = &foo_chunk[tail_foo];
 	mutex_lock(&f->mutex, 0);
+	f->inplace = false;
 	
 //	printf("RECV: [%d, %d] pos %d\n", a.rank, a.prev->rank, pos);
 	pos = pos2iov(pos, &f->chunk, a.tensor, 1);
@@ -343,6 +368,7 @@ start_recv(int pos)
 	return pos;
 }
 
+#ifdef INPLACE
 static int
 start_inplace_recv(int pos)
 {
@@ -350,6 +376,9 @@ start_inplace_recv(int pos)
 
 	f = &foo_chunk[tail_foo];
 	mutex_lock(&f->mutex, 0);
+	f->inplace = true;
+
+	iomap_state(pos + a.chunk_count, 0, 1);
 	
 //	printf("INRECV: [%d, %d] pos %d\n", a.rank, a.prev->rank, pos);
 	pos = pos2iov(pos, &f->iov, a.tensor, a.element_size);
@@ -361,6 +390,7 @@ start_inplace_recv(int pos)
 
 	return pos;
 }
+#endif
 
 static void
 finish_recv(struct iovec *chunk, struct iovec *iov)
@@ -400,7 +430,7 @@ apply_chunk(struct iovec *chunk, struct iovec *iov)
 		tensor[i] += data[i];
 }
 
-#if 0
+#ifndef INPLACE
 static void
 copy_chunk(struct iovec *chunk, struct iovec *iov)
 {
@@ -509,22 +539,32 @@ if (pos != send_pos)
 	for (i = 0; i < a.chunk_count; i++) {
 		finish_recv(&chunk, &iov);
 		apply_chunk(&chunk, &iov);
+#ifndef INPLACE
+		recv_pos = start_recv(recv_pos);
+#else
 		recv_pos = start_inplace_recv(recv_pos);
+#endif
 		send_pos = send_chunk(send_pos);
 	}
 
 	/* Broadcast */
 	while (send_pos != stop_pos) {
 		finish_recv(&chunk, &iov);
-//		copy_chunk(&chunk, &iov);
+#ifndef INPLACE
+		copy_chunk(&chunk, &iov);
+		recv_pos = start_recv(recv_pos);
+#else
 		recv_pos = start_inplace_recv(recv_pos);
+#endif
 		send_pos = send_chunk(send_pos);
 	}
 
 	/* Complete Broadcast */
 	for (i = 0; i < a.chunk_count; i++) {
 		finish_recv(&chunk, &iov);
-//		copy_chunk(&chunk, &iov);
+#ifndef INPLACE
+		copy_chunk(&chunk, &iov);
+#endif
 	}
 
 	if (check)

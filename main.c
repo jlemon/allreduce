@@ -74,6 +74,8 @@ printf("mesh formed, rank %d\n", rank);
 	    drv_read_partial[0], drv_write_partial[0],
 	    drv_read_partial[1], drv_write_partial[1]);
 	mutex_stats();
+
+	mesh_leave();
 }
 
 static void
@@ -86,6 +88,7 @@ start(void)
 
 	rank = mesh_join();
 printf("mesh formed, rank %d\n", rank);
+	if (opt.rank == -1) opt.rank = rank;		/* XXX fix this */
 	allreduce_init(rank, opt.size);
 
 	rc = pthread_create(&drv_thread, NULL, drv_loop, NULL);
@@ -336,8 +339,10 @@ handle_options(void)
 
 	if (!strcmp(opt.driver, "iou"))
 		io_driver = &iou_driver;
-	else
+	else if (!strcmp(opt.driver, "epoll"))
 		io_driver = &epoll_driver;
+	else
+		errx(1, "Unknown driver: %s", opt.driver);
 
 #if 0
 	opt.ifindex = if_nametoindex(opt.iface);
@@ -412,7 +417,7 @@ main(int argc, char **argv)
 	start();
 	if (0)
 		progress();
-	sleep(2);
+	sleep(1);
 
 	return 0;
 }

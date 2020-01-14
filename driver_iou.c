@@ -14,7 +14,7 @@
 #include "driver.h"
 #include "liburing.h"
 
-#define N_REQS	256
+#define N_REQS	128
 
 #define USE_FIXED_RECV 0
 #define USE_FIXED_SEND 0
@@ -22,6 +22,7 @@
 #define array_size(x)	(sizeof(x) / sizeof((x)[0]))
 
 struct drv_queue {
+	char *label;
 	pthread_mutex_t mutex;
 	int head;
 	int tail;
@@ -29,8 +30,9 @@ struct drv_queue {
 	struct drv_req *req[N_REQS];
 };
 
-static struct drv_req request[N_REQS];
-static struct drv_queue req_stack;
+static struct drv_req request[N_REQS * 2];
+static struct drv_queue req_send_stack;
+static struct drv_queue req_recv_stack;
 static struct drv_queue send_queue;
 static struct drv_queue recv_queue;
 
@@ -75,13 +77,15 @@ drv_push(struct drv_queue *q, struct drv_req *req)
 	pthread_mutex_unlock(&q->mutex);
 }
 
-static void
+static bool
 drv_queue(struct drv_queue *q, struct drv_req *req)
 {
+	bool empty;
 	int next;
 
 	pthread_mutex_lock(&q->mutex);
 
+	empty = drv_empty(q);
 	next = (q->tail + 1) == q->size ? 0 : (q->tail + 1);
 	if (next == q->head)
 		errx(1, "queue overflow");
@@ -89,27 +93,28 @@ drv_queue(struct drv_queue *q, struct drv_req *req)
 	q->tail = next;
 
 	pthread_mutex_unlock(&q->mutex);
+	return empty;
 }
 
-static struct drv_req *
+static bool
 drv_dequeue(struct drv_queue *q)
 {
-	struct drv_req *req = NULL;
+	struct drv_req *req;
+	bool empty;
+
+	if (drv_empty(q))
+		errx(1, "dequeue on empty queue");
 
 	pthread_mutex_lock(&q->mutex);
 
-	if (drv_empty(q))
-		goto unlock;
 	req = q->req[q->head++];
 	if (q->head == q->size)
 		q->head = 0;
 
-	if (drv_empty(q))
-		drv_unregister(req->fd);
+	empty = drv_empty(q);
 
-unlock:
 	pthread_mutex_unlock(&q->mutex);
-	return req;
+	return empty;
 }
 
 static struct drv_req *
@@ -151,16 +156,22 @@ iou_start(void)
 	if (fd < 0)
 		err_with(fd, "iou_queue_init");
 
-	req_stack.size = N_REQS;
+	req_send_stack.size = N_REQS;
+	req_recv_stack.size = N_REQS;
 	send_queue.size = N_REQS;
 	recv_queue.size = N_REQS;
-	pthread_mutex_init(&req_stack.mutex, NULL);
+	pthread_mutex_init(&req_send_stack.mutex, NULL);
+	pthread_mutex_init(&req_recv_stack.mutex, NULL);
 	pthread_mutex_init(&send_queue.mutex, NULL);
 	pthread_mutex_init(&recv_queue.mutex, NULL);
 	pthread_mutex_init(&io_mutex, NULL);
+	req_send_stack.label = "SEND STACK";
+	req_recv_stack.label = "RECV STACK";
 
-	for (i = 0; i < N_REQS; i++)
-		drv_push(&req_stack, &request[i]);
+	for (i = 0; i < N_REQS; i++) {
+		drv_push(&req_send_stack, &request[i]);
+		drv_push(&req_recv_stack, &request[N_REQS + i]);
+	}
 
 printf("IOU_START, ring_fd: %d\n", drv.ring.ring_fd);
 }
@@ -168,7 +179,21 @@ printf("IOU_START, ring_fd: %d\n", drv.ring.ring_fd);
 void
 iou_stop(void)
 {
+	struct io_uring *ring = &drv.ring;
+	struct io_uring_sqe *sqe;
+	int rc;
+
 	drv.stop = true;
+
+	pthread_mutex_lock(&io_mutex);
+
+	sqe = io_uring_get_sqe(ring);
+	io_uring_prep_nop(sqe);
+	rc = io_uring_submit(ring);
+	if (rc != 1)
+		err(1, "iou_stop: %d", rc);
+
+	pthread_mutex_unlock(&io_mutex);
 }
 
 void
@@ -255,20 +280,23 @@ iou_recv_req(struct drv_req *req)
 static void
 drv_recv_cb(struct drv_req *req, int events)
 {
+	bool empty;
+
 //printf("RECV COMPLETE\n");
 	req->done(req->arg);
-	req = drv_dequeue(&recv_queue);
-	drv_push(&req_stack, req);
+	empty = drv_dequeue(&recv_queue);
+	drv_push(&req_recv_stack, req);
+	if (empty)
+		return;
 	req = drv_peek(&recv_queue);
-	if (req)
-		iou_recv_req(req);
+	iou_recv_req(req);
 }
 
 void
 iou_recv(int fd, struct iovec *iov, int area, void (*done)(int), int arg)
 {
-	struct drv_req *req = drv_pop(&req_stack);
-	bool empty;
+	struct drv_req *req = drv_pop(&req_recv_stack);
+	bool first;
 
 	req->fd = fd;
 	req->arg = arg;
@@ -278,9 +306,8 @@ iou_recv(int fd, struct iovec *iov, int area, void (*done)(int), int arg)
 	req->done = done;
 	req->area = area;
 
-	empty = drv_empty(&recv_queue);
-	drv_queue(&recv_queue, req);
-	if (empty)
+	first = drv_queue(&recv_queue, req);
+	if (first)
 		iou_recv_req(req);
 }
 
@@ -315,30 +342,34 @@ iou_send_req(struct drv_req *req)
 static void
 drv_send_cb(struct drv_req *req, int events)
 {
-//printf("SEND COMPLETE\n");
+	bool empty;
+
 //	req->done(req->arg);
-	req = drv_dequeue(&send_queue);
-	drv_push(&req_stack, req);
+	empty = drv_dequeue(&send_queue);
+	drv_push(&req_send_stack, req);
+	if (empty)
+		return;
 	req = drv_peek(&send_queue);
-	if (req)
-		iou_send_req(req);
+	iou_send_req(req);
 }
+
+int send_count;
 
 void
 iou_send(int fd, struct iovec *iov, int area)
 {
-	struct drv_req *req = drv_pop(&req_stack);
-	bool empty;
+	struct drv_req *req = drv_pop(&req_send_stack);
+	bool first;
 
 	req->fd = fd;
 	req->iov = *iov;
 	req->callback = drv_send_cb;
 	req->send = true;
 	req->area = area;
+	req->scratch = send_count++;
 
-	empty = drv_empty(&send_queue);
-	drv_queue(&send_queue, req);
-	if (empty)
+	first = drv_queue(&send_queue, req);
+	if (first)
 		iou_send_req(req);
 }
 
@@ -349,12 +380,12 @@ iou_handle_cqe(struct io_uring_cqe *cqe)
 
 	req = io_uring_cqe_get_data(cqe);
 	if (!req)
-		return;			/* POLLIN link, ignore, continue */
+		return;			/* not req: ignore, continue */
 
 	if (cqe->res != req->iov.iov_len) {
 		if (cqe->res == 0) {
 			printf("type: %s\n", req->send ? "SEND" : "RECV");
-			errx(1, "WTF, returned cqe with 0 bytes");
+			errx(1, "cqe with 0 bytes == unexpected EOF");
 		}
 		/* short operation, resubmit */
 		req->iov.iov_base += cqe->res;
